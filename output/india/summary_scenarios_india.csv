@@ -1,0 +1,22 @@
+,,Capacities (kW),Capex ($/y),FOM ($/y),Expected opex ($/y),Expected cost ($/y)
+deterministic_optimal,Coal, 0.22 , 20.69 , 5.30 ,,
+deterministic_optimal,Solar, -   , -   , -   ,,
+deterministic_optimal,Wind, 2.43 , 182.01 , 19.43 ,,
+deterministic_optimal,Storage, 0.50 , 18.04 , 1.49 ,,
+deterministic_optimal,Total, 3.15 , 220.74 , 26.22 , 47.05 , 294.01 
+,,,,,,
+deterministic_renewable,Solar, -   , -   , -   ,,
+deterministic_renewable,Wind, 3.28 , 245.85 , 26.24 ,,
+deterministic_renewable,Storage, 0.61 , 22.14 , 1.83 ,,
+deterministic_renewable,Total, 3.89 , 267.99 , 28.07 , 0.00 , 296.06 
+,,,,,,
+stochastic_optimal,Coal, 0.98 , 91.79 , 23.52 ,,
+stochastic_optimal,Solar, -   , -   , -   ,,
+stochastic_optimal,Wind, 0.93 , 69.63 , 7.43 ,,
+stochastic_optimal,Storage, -   , -   , -   ,,
+stochastic_optimal,Total, 1.91 , 161.42 , 30.95 , 226.99 , 419.36 
+,,,,,,
+stochastic_renewable,Solar, 3.12 , 160.99 , 17.19 ,,
+stochastic_renewable,Wind, 5.20 , 389.45 , 41.57 ,,
+stochastic_renewable,Storage, 4.13 , 150.40 , 12.40 ,,
+stochastic_renewable,Total, 12.45 , 700.85 , 71.16 , 294.88 ," 1,066.89 "

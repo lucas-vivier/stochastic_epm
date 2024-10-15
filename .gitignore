@@ -1,0 +1,81 @@
+
+gams_code/
+doc/
+export_renewable_data/
+data/
+output/test
+
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+*.env
+*.venv
+.venv/
+env/
+ENV/
+venv/
+ENV/
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.Dumpster
+*.swp
+Icon?
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+.code-workspace
+
+# GAMS
+*.g00
+*.g01
+*.g02
+*.gdx
+*.lst
+*.pf
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# GAMS cache files
+*.g00
+*.g01
+*.g02
+*.gdx
+*.lst
+*.pf

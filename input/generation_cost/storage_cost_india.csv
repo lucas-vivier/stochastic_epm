@@ -1,0 +1,5 @@
+﻿Capex,$/kWh,300
+FOM,$/kWh,3
+Life,Years,14
+WACC,%,0.08
+Efficiency,%,0.9

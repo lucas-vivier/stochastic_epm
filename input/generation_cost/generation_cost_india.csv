@@ -1,0 +1,5 @@
+﻿Metadata,$/kW,$/kW/year,$/kWh,Years,%
+,Capex,FOM,Opex,Life,WACC
+Coal,1000,24,0.042,25,0.08
+Solar,550,5.5,0,25,0.08
+Wind,800,8,0,25,0.08
