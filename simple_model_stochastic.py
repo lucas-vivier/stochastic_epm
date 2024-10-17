@@ -4,12 +4,14 @@
 import os, sys
 from gamspy import Container, Set, Parameter, Variable, Equation, Model, Sense, Sum, Options, Ord
 from pandas import read_csv, concat, Series, DataFrame, concat, Index
+import pandas as pd
+
 import matplotlib.pyplot as plt
 
 
 def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plants=None, 
               path_output=None, generation_cost=None, load_profile=None, production_profile_solar=None, production_profile_wind=None, 
-              storage_cost=None, probability=None):
+              storage_cost=None, probability=None, duration='day'):
     """
     Main function to run the energy planning model with stochastic renewable generation.
     
@@ -23,6 +25,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     - production_profile: str, name of the file with production profile data
     - storage_cost: str, name of the file with storage cost data
     - probability: str, name of the file with probability data
+    - duration: str, duration of the model (e.g. 'year')
     
     Returns:
     - summary: pandas DataFrame with the summary of the model results
@@ -37,18 +40,90 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
             os.makedirs(path_output)
 
     # Model parameters
-    cost_unmet, cost_surplus = 1, 0.15 # $/kWh, $/kWh
+    cost_unmet, cost_surplus = 1, 0 # $/kWh, $/kWh
     rampup_coal, rampdown_coal = 1.5, 0.5 # doesn't work in the current version
     min_gen_coal_coef = 0.4
     coal_ramp, min_gen_coal, total_capacity_constraint = True, True, True
+    
+    # Extension factor
+    extension_factor = 365
+    if duration == 'year':
+        extension_factor = 1
 
     # Loading data
-    load_profile_df = read_csv(os.path.join(folder_input, load_profile), index_col=0)
+    load_profile_df = read_csv(os.path.join(folder_input, load_profile), index_col=None)
     gen_data_df = read_csv(os.path.join(folder_input, generation_cost), header=[1], index_col=0)
     storage_cost_df = read_csv(os.path.join(folder_input, storage_cost), index_col=0, header=None).iloc[:, 1]
     
     production_profile_solar_df = read_csv(os.path.join(folder_input, production_profile_solar), index_col=0)
     production_profile_wind_df = read_csv(os.path.join(folder_input, production_profile_wind), index_col=0)
+
+    if duration == 'year':
+        # Ensure that the production profile is in the correct format
+        
+        def parse_datetime_data(profile_df):
+            profile_df.index = pd.to_datetime(profile_df.index)
+            profile_df.index = profile_df.index.floor('H')
+            
+            # Remove 29/2
+            profile_df = profile_df[~((profile_df.index.month == 2) & (profile_df.index.day == 29))]
+            
+            # Remove the last 5 hours of the year
+            profile_df.drop(profile_df.loc[profile_df.tail(5).index].index, inplace=True)
+            
+            def complete_first_day(df):
+                # Missing hours for the first day (January 1st 00:00 - 05:00)
+                missing_hours = pd.date_range('2024-01-01 00:00:00', '2024-01-01 04:00:00', freq='H')
+                
+                # Extract the corresponding data from the second day (January 2nd 00:00 - 05:00)
+                corresponding_hours = pd.date_range('2024-01-02 00:00:00', '2024-01-02 04:00:00', freq='H')
+                corresponding_data = df.loc[corresponding_hours]
+                
+                # Set the index of the corresponding data to the missing hours
+                corresponding_data.index = missing_hours
+                
+                # Append the missing hours and data to the original DataFrame
+                df_complete = pd.concat([corresponding_data, df]).sort_index()
+                
+                return df_complete
+            
+            profile_df = complete_first_day(profile_df)
+            return profile_df
+
+        production_profile_solar_df = parse_datetime_data(production_profile_solar_df)
+        production_profile_solar_df = production_profile_solar_df.reset_index(drop=True)
+        production_profile_solar_df.index = production_profile_solar_df.index + 1
+        
+        production_profile_wind_df = parse_datetime_data(production_profile_wind_df)
+        production_profile_wind_df = production_profile_wind_df.reset_index(drop=True)
+        production_profile_wind_df.index = production_profile_wind_df.index + 1
+        
+        # Select few years to reduce complexity
+        # Get columns for P10, P50, P90
+        temp = production_profile_wind_df.mean()
+        p10, p50, p90 = temp.quantile(0.9), temp.median(), temp.quantile(0.1)
+        p10, p50, p90 = (temp - p10).abs().idxmin(), (temp - p50).abs().idxmin(), (temp - p90).abs().idxmin()
+        
+        years = [p10, p50, p90]
+        
+        production_profile_solar_df = production_profile_solar_df.loc[:, years]
+        production_profile_wind_df = production_profile_wind_df.loc[:, years]
+        
+        def parse_load_data(profile_df):
+            profile_df['time'] = profile_df['Year'].astype(str) + ' ' + profile_df['Date']
+            profile_df['time'] = pd.to_datetime(profile_df['time'], format='%Y %d-%b %I%p')
+            
+            profile_df = profile_df.set_index('time').loc[:, 'Load']
+            profile_df = profile_df / profile_df.max()
+            profile_df.sort_index(inplace=True)
+            
+            return profile_df
+        
+        load_profile_df = parse_load_data(load_profile_df)
+        load_profile_df = load_profile_df.reset_index(drop=True)
+        load_profile_df.index = load_profile_df.index + 1
+        
+                
     if probability is not None:
         probability_df = read_csv(os.path.join(folder_input, probability), index_col=0)
     else:
@@ -83,6 +158,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     if power_plants is not None:
         gen_data_df = gen_data_df.loc[gen_data_df.index.isin(power_plants)]
         production_profile_df = production_profile_df.loc[production_profile_df.index.get_level_values('RE').isin(power_plants)]
+        
     
     # Initialize the model container
     m = Container()
@@ -90,7 +166,10 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     # Define sets
     g = Set(container=m, name='g', records=list(gen_data_df.index.unique()), description='Generation technologies')
     RE = Set(container=m, name='RE', domain=g, records=[i for i in list(gen_data_df.index.unique()) if i in ['Solar', 'Wind']], description='Renewable generation technologies')
-    t = Set(container=m, name='t', records=[str(i) for i in range(1, 25)], description='24 time steps')
+    if duration == 'day':
+        t = Set(container=m, name='t', records=[str(i) for i in range(1, 25)], description='24 time steps')
+    elif duration == 'year':
+        t = Set(container=m, name='t', records=[str(i) for i in range(1, 8761)], description='8760 time steps')
     s = Set(container=m, name='s', records=list(probability_df.index.unique()), description='Renewable generation scenarios')
 
     # Define parameters
@@ -108,7 +187,8 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     Gen = Variable(container=m, name='Gen', domain=[g, s, t], type="Positive")
     StorCap = Variable(container=m, name='StorCap', type="Positive")
     Storage = Variable(container=m, name='Storage', domain=[s, t], type="Positive")
-    Storage.l[s, '1'] = 0
+    if 'Coal' not in list(gen_data_df.index.unique()):
+        Storage.fx[s, '1'] = load_profile_df.iloc[:10].sum()
     StorInj = Variable(container=m, name='StorInj', domain=[s, t], type="Positive")
     StorGen = Variable(container=m, name='StorGen', domain=[s, t], type="Positive")
     Unmet = Variable(container=m, name='Unmet', domain=[s, t], type="Positive")
@@ -121,11 +201,11 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
 
     # Define the Storage Balance equation
     StorBal = Equation(container=m, name="StorBal", domain=[s, t])
-    StorBal[s, t] = Storage[s, t] == Storage[s, t.lag(1)] + StorInj[s, t] - StorGen[s, t]
+    StorBal[s, t].where[Ord(t) > 1] = Storage[s, t] == Storage[s, t.lag(1)] + StorInj[s, t] - StorGen[s, t]
 
     # Storage Limit equation
     StorLim = Equation(container=m, name="StorLim", domain=[s, t])
-    StorLim[s, t] = Storage[s, t] <= StorCap
+    StorLim[s, t].where[Ord(t) > 1] = Storage[s, t] <= StorCap
 
     # Storage Generation Capacity equation
     StorGenCap = Equation(container=m, name="StorGenCap", domain=[s, t])
@@ -159,7 +239,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         CapCon1[g, s] = Sum(t, Gen[g, s, t]) <= Cap[g] * len(t.records) * 0.9
 
     # Define the objective function
-    obj = Sum((g, s, t), Gen[g, s, t] * gen_data["Opex"][g] * 365 * probability_scenario[s]) + Sum((s, t), (Unmet[s, t] * cost_unmet + Surplus[s, t] * cost_surplus) * 365 * probability_scenario[s]) + Sum(g, Cap[g] * (gen_data["AnnCapex"][g] + gen_data["FOM"][g])) + StorCap * (capex_storage + fom_storage)
+    obj = Sum((g, s, t), Gen[g, s, t] * gen_data["Opex"][g] * extension_factor * probability_scenario[s]) + Sum((s, t), (Unmet[s, t] * cost_unmet + Surplus[s, t] * cost_surplus) * extension_factor * probability_scenario[s]) + Sum(g, Cap[g] * (gen_data["AnnCapex"][g] + gen_data["FOM"][g])) + StorCap * (capex_storage + fom_storage)
             
     # Define and solve the model
     stochastic_model = Model(
@@ -172,7 +252,12 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     )
 
     # Solve the model
-    summary_model = stochastic_model.solve()
+    if path_output is not None:
+        model_file = os.path.join(path_output, 'model.gms')
+    else:
+        model_file = 'output/model.gms'
+    with open(model_file, "w") as file:
+        summary_model = stochastic_model.solve(output=file)
 
     # Retrieve and display results
 
@@ -206,8 +291,15 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         generation.rename(columns={'storage_inj': 'Storage injection', 'storage_gen': 'Storage generation'}, inplace=True)
         
         generation.to_csv(os.path.join(path_output, 'generation_model.csv'))
-        plot_generation_mix(generation, discrete_time=True, path_save=os.path.join(path_output, 'generation_mix_discrete.png'))
-        plot_generation_mix(generation, discrete_time=False, path_save=os.path.join(path_output, 'generation_mix.png'))
+        xlabel = 'Time (hours)'
+        if duration == 'year':
+            generation = generation.droplevel('s')
+            generation.index = generation.index.astype(int)
+            generation = generation.groupby(generation.index // 24).mean()
+            xlabel = 'Time (days)'
+
+        # plot_generation_mix(generation, discrete_time=True, path_save=os.path.join(path_output, 'generation_mix_discrete.png'))
+        plot_generation_mix(generation, discrete_time=False, path_save=os.path.join(path_output, 'generation_mix.png'), xlabel=xlabel)
 
     # Calculate total capital expenditure
     Cap_sol = extract_results(Cap.records)
@@ -219,10 +311,10 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     total_opex = total_cost - total_capex
 
     # Display summary
-    summary = {i: [Cap_sol[i], gen_data_df["AnnCapex"][i] * Cap_sol[i], gen_data_df["FOM"][i] * Cap_sol[i]] for i in Cap_sol.index}
-    summary.update({"Storage": [StorCap_sol, capex_storage * StorCap_sol, fom_storage * StorCap_sol]})
+    summary = {i: [Cap_sol[i], gen_data_df["AnnCapex"][i] * Cap_sol[i], gen_data_df["FOM"][i] * Cap_sol[i], gen_data_df["Capex"][i] * Cap_sol[i]] for i in Cap_sol.index}
+    summary.update({"Storage": [StorCap_sol, capex_storage * StorCap_sol, fom_storage * StorCap_sol, storage_cost_df['Capex' ] * StorCap_sol]})
     summary = DataFrame(summary).T
-    summary.columns = ['Capacities (kW)', 'Capex ($/y)', 'FOM ($/y)']
+    summary.columns = ['Capacities (kW)', 'Capex ($/y)', 'FOM ($/y)', 'Total capex ($)']
 
     summary.loc['Total'] = summary.sum()
     summary.loc['Total', 'Expected opex ($/y)'] = total_opex
@@ -234,7 +326,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     return summary
 
 
-def plot_generation_mix(df, discrete_time=True, path_save='output/generation_mix.png'):
+def plot_generation_mix(df, discrete_time=True, path_save='output/generation_mix.png', xlabel="Time (hours)"):
     """
     Plots the generation mix and load curve from a pandas DataFrame in a flexible and replicable way.
     
@@ -283,8 +375,8 @@ def plot_generation_mix(df, discrete_time=True, path_save='output/generation_mix
     plt.plot(time_steps, load, color="red", label="Load", linewidth=2, linestyle="--")
 
     # Labels and Title
-    plt.xlabel("Time (hours)")
-    plt.ylabel("Generation / Load (GW)")
+    plt.xlabel(xlabel)
+    plt.ylabel("Generation / Load (kW)")
     plt.title("Generation Mix and Load")
 
     # Legend
@@ -297,7 +389,17 @@ def plot_generation_mix(df, discrete_time=True, path_save='output/generation_mix
 
 
 if __name__ == '__main__':
+    import logging
+    import time
     
+    # Set up logging to a file
+    logging.basicConfig(filename='process_log.log', level=logging.INFO, 
+                        format='%(asctime)s - %(message)s')
+
+    # Start time of the script
+    start_time = time.time()
+    logging.info("Process started")
+
     run = 'india' # 'india'
     
     folder = 'output'
@@ -318,10 +420,11 @@ if __name__ == '__main__':
     elif run == 'india':
         input_india = {
             'generation_cost': 'generation_cost/generation_cost_india.csv',
-            'load_profile': 'load_profile/load_profile_india.csv',
-            'production_profile_solar': 'production_profile/production_profile_solar_india.csv',
-            'production_profile_wind': 'production_profile/production_profile_wind_india.csv',
+            'load_profile': 'load_profile/load_profile_india_year.csv',
+            'production_profile_solar': 'production_profile/production_profile_solar_india_year.csv',
+            'production_profile_wind': 'production_profile/production_profile_wind_india_year.csv',
             'storage_cost': 'generation_cost/storage_cost_india.csv',
+            'duration': 'year'
             }
         input_model = input_india
     
@@ -332,17 +435,26 @@ if __name__ == '__main__':
         
         scenarios = {'deterministic_optimal': {'deterministic': True, 'power_plants': None, 'path_output': folder},
                     'deterministic_renewable': {'deterministic': True, 'power_plants': ['Solar', 'Wind'], 'path_output': folder},
+                    'deterministic_solar': {'deterministic': True, 'power_plants': ['Solar'], 'path_output': folder},
                         'stochastic_optimal': {'deterministic': False, 'power_plants': None},
-                        'stochastic_renewable': {'deterministic': False, 'power_plants': ['Solar', 'Wind']}
+                        'stochastic_renewable': {'deterministic': False, 'power_plants': ['Solar', 'Wind']},
+                        'stochastic_solar': {'deterministic': False, 'power_plants': ['Solar']}
                         }
+        # scenarios = {'deterministic_renewable': {'deterministic': True, 'power_plants': ['Solar'], 'path_output': folder}}
+
 
         results = {s: run_model(name_model=s, **values, **input_model) for s, values in scenarios.items()}
         results = concat(results, axis=0)
         results.to_csv(os.path.join(folder, 'summary_scenarios_{}.csv'.format(run)))
+        
+        # Log the end of the process and the duration
+        logging.info("Process finished")
+        logging.info(f"Total processing time: {time.time() - start_time:.2f} seconds")
+
     else:
         folder = os.path.join('output', 'test')
         if not os.path.exists(folder):
             os.mkdir(folder)
-        run_model(name_model='test', deterministic=False, power_plants=None, path_output=folder, **input_china)
+        run_model(name_model='test', deterministic=False, power_plants=None, path_output=folder, duration='year', **input_model)
 
 print('End of script')
