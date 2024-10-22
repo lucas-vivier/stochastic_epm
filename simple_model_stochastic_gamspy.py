@@ -43,7 +43,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     cost_unmet, cost_surplus = 1, 0 # $/kWh, $/kWh
     rampup_coal, rampdown_coal = 1.5, 0.5 # doesn't work in the current version
     min_gen_coal_coef = 0.4
-    coal_ramp, min_gen_coal, total_capacity_constraint = True, True, True
+    coal_ramp, min_gen_coal, total_capacity_constraint, fcas_constraint = True, True, True, False
     
     # Extension factor
     extension_factor = 365
@@ -122,8 +122,10 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         load_profile_df = parse_load_data(load_profile_df)
         load_profile_df = load_profile_df.reset_index(drop=True)
         load_profile_df.index = load_profile_df.index + 1
-        
-                
+    elif duration == 'day':
+        load_profile_df = load_profile_df.loc[:, 'Load']
+        load_profile_df.index = load_profile_df.index + 1
+       
     if probability is not None:
         probability_df = read_csv(os.path.join(folder_input, probability), index_col=0)
     else:
@@ -163,6 +165,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     # Initialize the model container
     m = Container()
 
+    # -------------------------
     # Define sets
     g = Set(container=m, name='g', records=list(gen_data_df.index.unique()), description='Generation technologies')
     RE = Set(container=m, name='RE', domain=g, records=[i for i in list(gen_data_df.index.unique()) if i in ['Solar', 'Wind']], description='Renewable generation technologies')
@@ -172,16 +175,17 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         t = Set(container=m, name='t', records=[str(i) for i in range(1, 8761)], description='8760 time steps')
     s = Set(container=m, name='s', records=list(probability_df.index.unique()), description='Renewable generation scenarios')
 
+    # -------------------------
     # Define parameters
-    list_parameters = ['Capex', 'FOM', 'Opex', 'Life', 'WACC', 'AnnCapex', 'Load', 'Solar', 'Wind']
+    list_parameters = ['FOM', 'Opex', 'AnnCapex']
     gen_data = {i: Parameter(container=m, name=i, domain=g, records=gen_data_df[i].reset_index()) for i in gen_data_df.columns if i in list_parameters}
-    
     
     production_profile = Parameter(container=m, name='ProductionProfile', domain=[RE, t, s], records=production_profile_df)
     load_profile = Parameter(container=m, name='Load', domain=t, records=load_profile_df.reset_index())
 
     probability_scenario = Parameter(container=m, name='Prob', domain=[s], records=probability_df.reset_index())
 
+    # -------------------------
     # Define variables
     Cap = Variable(container=m, name='Cap', domain=[g], type="Positive")
     Gen = Variable(container=m, name='Gen', domain=[g, s, t], type="Positive")
@@ -189,15 +193,26 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     Storage = Variable(container=m, name='Storage', domain=[s, t], type="Positive")
     if 'Coal' not in list(gen_data_df.index.unique()):
         Storage.fx[s, '1'] = load_profile_df.iloc[:10].sum()
+    else:
+        Storage.fx[s, '1'] = 0
     StorInj = Variable(container=m, name='StorInj', domain=[s, t], type="Positive")
     StorGen = Variable(container=m, name='StorGen', domain=[s, t], type="Positive")
     Unmet = Variable(container=m, name='Unmet', domain=[s, t], type="Positive")
     Surplus = Variable(container=m, name='Surplus', domain=[s, t], type="Positive")
-    #Cost = Variable(container=m, name='Cost')
+    
+    if fcas_constraint is True:
+        RaiseFCAS = Variable(container=m, name='RaiseFCAS', domain=[g, s, t], type="Positive")
+        LowerFCAS = Variable(container=m, name='LowerFCAS', domain=[g, s, t], type="Positive")
+        RaiseFCAS_Stor = Variable(container=m, name='RaiseFCAS_Stor', domain=[s, t], type="Positive")
+        LowerFCAS_Stor = Variable(container=m, name='LowerFCAS_Stor', domain=[s, t], type="Positive")
+
+    # -------------------------
+    # Define constraints
 
     # Define the Demand equation
     Demand = Equation(container=m, name="Demand", domain=[s, t])
     Demand[s, t] = Sum(g, Gen[g, s, t]) + StorGen[s, t] * efficiency_storage + Unmet[s, t] - Surplus[s, t] == load_profile[t] + StorInj[s, t]
+    
 
     # Define the Storage Balance equation
     StorBal = Equation(container=m, name="StorBal", domain=[s, t])
@@ -237,10 +252,59 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     if total_capacity_constraint is True:
         CapCon1 = Equation(container=m, name="CapCon1", domain=[g, s])
         CapCon1[g, s] = Sum(t, Gen[g, s, t]) <= Cap[g] * len(t.records) * 0.9
+        
+    if fcas_constraint is True:
+        limit_fcas_capacity = 0.1
+        limit_fcas_storage = 0.5
+        coeff_re_fcas = 0.15
+        
+        # Constraint 1: Limit RaiseFCAS to 10% of the generation capacity
+        RaiseFCAS_con = Equation(container=m, name="RaiseFCAS_con", domain=[g, s, t])
+        RaiseFCAS_con[g, s, t] = RaiseFCAS[g, s, t] <= Cap[g] * limit_fcas_capacity
+
+        # Constraint 2: Limit LowerFCAS to 10% of the generation capacity
+        LowerFCAS_con = Equation(container=m, name="LowerFCAS_con", domain=[g, s, t])
+        LowerFCAS_con[g, s, t] = LowerFCAS[g, s, t] <= Cap[g] * limit_fcas_capacity
+
+        # Constraint 3: Storage can provide up to 50% of its capacity as RaiseFCAS
+        RaiseFCAS_Stor_con = Equation(container=m, name="RaiseFCAS_Stor_con", domain=[s, t])
+        RaiseFCAS_Stor_con[s, t] = RaiseFCAS_Stor[s, t] <= StorCap * limit_fcas_storage
+
+        # Constraint 4: Storage can provide up to 50% of its capacity as LowerFCAS
+        LowerFCAS_Stor_con = Equation(container=m, name="LowerFCAS_Stor_con", domain=[s, t])
+        LowerFCAS_Stor_con[s, t] = LowerFCAS_Stor[s, t] <= StorCap * limit_fcas_storage
+        
+        # Constraint 6: Maintain a minimum operational level for coal (40% of capacity)
+        if "Coal" in list(gen_data_df.index.unique()):
+            Gen_LowerFCAS_con = Equation(container=m, name="Gen_LowerFCAS_con", domain=[s, t])
+            Gen_LowerFCAS_con[s, t] = Gen["Coal", s, t] - LowerFCAS["Coal", s, t] >= Cap["Coal"] * min_gen_coal_coef
+
+        # Constraint 5: Ensure total generation including RaiseFCAS does not exceed capacity
+        Gen_RaiseFCAS_con = Equation(container=m, name="Gen_RaiseFCAS_con", domain=[g, s, t])
+        Gen_RaiseFCAS_con[g, s, t] = Gen[g, s, t] + RaiseFCAS[g, s, t] <= Cap[g]
+        
+        # Constraint 7: Limit storage generation plus RaiseFCAS to available storage
+        StorGen_RaiseFCAS_con = Equation(container=m, name="StorGen_RaiseFCAS_con", domain=[s, t])
+        StorGen_RaiseFCAS_con[s, t] = StorGen[s, t] + RaiseFCAS_Stor[s, t] <= Storage[s, t]
+
+        # Constraint 8: Ensure LowerFCAS does not exceed available storage charge
+        LowerFCAS_Stor_con2 = Equation(container=m, name="LowerFCAS_Stor_con2", domain=[s, t])
+        LowerFCAS_Stor_con2[s, t] = LowerFCAS_Stor[s, t] >= Storage[s, t]
+
+        # Constraint 9: Total RaiseFCAS (generation + storage) must cover largest unit contingency
+        RaiseFCAS_total_con = Equation(container=m, name="RaiseFCAS_total_con", domain=[g, s, t])
+        RaiseFCAS_total_con[g, s, t] = RaiseFCAS["Coal", s, t] + RaiseFCAS_Stor[s, t] >= coeff_re_fcas * Sum(RE, Gen[RE, s, t])
+
+        # Constraint 10: Total LowerFCAS must account for a portion of renewable generation
+        LowerFCAS_total_con = Equation(container=m, name="LowerFCAS_total_con", domain=[g, s, t])
+        LowerFCAS_total_con[g, s, t] = LowerFCAS["Coal", s, t] + LowerFCAS_Stor[s, t] >= coeff_re_fcas * Sum(RE, Gen[RE, s, t])
+
+    # -------------------------
 
     # Define the objective function
     obj = Sum((g, s, t), Gen[g, s, t] * gen_data["Opex"][g] * extension_factor * probability_scenario[s]) + Sum((s, t), (Unmet[s, t] * cost_unmet + Surplus[s, t] * cost_surplus) * extension_factor * probability_scenario[s]) + Sum(g, Cap[g] * (gen_data["AnnCapex"][g] + gen_data["FOM"][g])) + StorCap * (capex_storage + fom_storage)
-            
+    
+    # -------------------------
     # Define and solve the model
     stochastic_model = Model(
         container=m,
@@ -250,7 +314,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         sense=Sense.MIN,
         objective=obj
     )
-
+    # -------------------------
     # Solve the model
     if path_output is not None:
         model_file = os.path.join(path_output, 'model.gms')
@@ -259,17 +323,20 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     with open(model_file, "w") as file:
         summary_model = stochastic_model.solve(output=file)
 
+    # -------------------------
     # Retrieve and display results
 
     # Extract results
-    def extract_results(records):
+    def extract_results(records, column='level'):
         """Extract results from a GAMS records object"""
-        temp = records.drop(columns=['marginal', 'lower', 'upper', 'scale'])
+        column_default = ['level', 'marginal', 'lower', 'upper', 'scale']
+        temp = records.drop(columns=[c for c in column_default if c != column])
         if len(temp.columns) > 1:
-            temp = temp.set_index([c for c in temp.columns if c != 'level']).squeeze()
+            temp = temp.set_index([c for c in temp.columns if c != column]).squeeze()
         else:
-            temp = float(temp['level'].iloc[0])
+            temp = float(temp[column].iloc[0])
         return temp
+    
 
     # Generation results
     StorCap_sol = extract_results(StorCap.records)
@@ -278,10 +345,32 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     StorGen_sol = extract_results(StorGen.records)
     Unmet_sol = extract_results(Unmet.records)
     Surplus_sol = extract_results(Surplus.records)
+    Storage = extract_results(Storage.records)
+    
+    dual_value_demand = extract_results(Demand.records, column='marginal')
 
     generation = Gen_sol.unstack('g')
-    generation = concat((generation, StorInj_sol.rename('storage_inj'), StorGen_sol.rename('storage_gen'),Unmet_sol.rename('unmet'), Surplus_sol.rename('surplus')), axis=1)
-
+    generation = concat((generation, 
+                         StorInj_sol.rename('storage_inj'), 
+                         StorGen_sol.rename('storage_gen'),
+                         Storage.rename('storage_status'),
+                         Unmet_sol.rename('unmet'), 
+                         Surplus_sol.rename('surplus')), 
+                        axis=1)
+    
+    if fcas_constraint is True:
+        LowerFCAS = extract_results(LowerFCAS.records).groupby(['s', 't']).sum()
+        RaiseFCAS = extract_results(RaiseFCAS.records).groupby(['s', 't']).sum()
+        LowerFCAS_Stor = extract_results(LowerFCAS_Stor.records)
+        RaiseFCAS_Stor = extract_results(RaiseFCAS_Stor.records)
+        
+        generation = concat((generation,                   
+                            LowerFCAS.rename('lower_fcas'),
+                            RaiseFCAS.rename('up_fcas'),
+                            LowerFCAS_Stor.rename('lower_fcas_stor'),
+                            RaiseFCAS_Stor.rename('up_fcas_stor')),
+                            axis=1)
+                                
     load_profile_df = load_profile_df.rename_axis('t')
     load_profile_df.index = load_profile_df.index.astype(str)
     generation = generation.reorder_levels(['t', 's'])
@@ -400,7 +489,7 @@ if __name__ == '__main__':
     start_time = time.time()
     logging.info("Process started")
 
-    run = 'india' # 'india'
+    run = 'china' # 'india'
     
     folder = 'output'
     if not os.path.exists(folder):
@@ -428,7 +517,7 @@ if __name__ == '__main__':
             }
         input_model = input_india
     
-    if True:
+    if False:
         folder = os.path.join('output', run)
         if not os.path.exists(folder):
             os.mkdir(folder)
@@ -455,6 +544,6 @@ if __name__ == '__main__':
         folder = os.path.join('output', 'test')
         if not os.path.exists(folder):
             os.mkdir(folder)
-        run_model(name_model='test', deterministic=False, power_plants=None, path_output=folder, duration='year', **input_model)
+        run_model(name_model='test', deterministic=True, power_plants=None, path_output=folder, duration='day', **input_model)
 
 print('End of script')

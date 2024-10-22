@@ -4,7 +4,7 @@ doc/
 export_renewable_data/
 data/
 output/test
-
+test/
 
 # Python
 __pycache__/
@@ -46,6 +46,7 @@ Icon?
 *.gdx
 *.lst
 *.pf
+*.lxi
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
