@@ -1,17 +1,22 @@
 #' Energy Planning Stochastic Model
 #' This script defines a GAMS model for the power system with stochastic renewable generation.
 
-import os, sys
+import os, sys, time
+from multiprocessing import Pool, cpu_count
 from gamspy import Container, Set, Parameter, Variable, Equation, Model, Sense, Sum, Options, Ord
 from pandas import read_csv, concat, Series, DataFrame, concat, Index
 import pandas as pd
-
+import warnings
+        
 import matplotlib.pyplot as plt
+
+from figures import plot_generation_mix
 
 
 def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plants=None, 
               path_output=None, generation_cost=None, load_profile=None, production_profile_solar=None, production_profile_wind=None, 
-              storage_cost=None, probability=None, duration='day', social_cost_emission=0, fcas_constraint=True, emission_constraint=None):
+              storage_cost=None, probability=None, duration='day', social_cost_emission=0, fcas_constraint=True, emission_constraint=None,
+              cost_unmet=1, cost_surplus=0, rampup_coal=1.5, rampdown_coal=0.5, min_gen_coal_coef=0.4):
     """
     Main function to run the energy planning model with stochastic renewable generation.
     
@@ -30,6 +35,8 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     Returns:
     - summary: pandas DataFrame with the summary of the model results
     """
+    warnings.filterwarnings("ignore", message="Could not infer format, so each element will be parsed individually")
+
     print('Running model: {}'.format(name_model))
     # Input files structure
     folder_input = 'input'
@@ -39,10 +46,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         if not os.path.exists(path_output):
             os.makedirs(path_output)
 
-    # Model parameters
-    cost_unmet, cost_surplus = 1, 0 # $/kWh, $/kWh
-    rampup_coal, rampdown_coal = 1.5, 0.5 # doesn't work in the current version
-    min_gen_coal_coef = 0.4
+    # Model constraints
     coal_ramp, min_gen_coal, total_capacity_constraint = True, True, True
     
     # Extension factor
@@ -62,6 +66,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         # Ensure that the production profile is in the correct format
         
         def parse_datetime_data(profile_df):
+            # 
             profile_df.index = pd.to_datetime(profile_df.index)
             profile_df.index = profile_df.index.floor('H')
             
@@ -69,7 +74,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
             profile_df = profile_df[~((profile_df.index.month == 2) & (profile_df.index.day == 29))]
             
             # Remove the last 5 hours of the year
-            profile_df.drop(profile_df.loc[profile_df.tail(5).index].index, inplace=True)
+            profile_df = profile_df.drop(profile_df.loc[profile_df.tail(5).index].index)
             
             def complete_first_day(df):
                 # Missing hours for the first day (January 1st 00:00 - 05:00)
@@ -127,7 +132,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         load_profile_df.index = load_profile_df.index + 1
        
     if probability is not None:
-        probability_df = read_csv(os.path.join(folder_input, probability), index_col=0)
+        probability_df = read_csv(os.path.join(folder_input, probability), index_col=0).squeeze().rename(None)
     else:
         probability_df = Series(1 / len(production_profile_solar_df.columns), index=production_profile_solar_df.columns)
 
@@ -143,8 +148,6 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     if deterministic is True:
         if 'Avg' in probability_df.index:
             # Select the average probability scenario
-            probability_df = probability_df.loc['Avg'].to_frame().T
-            probability_df.loc['Avg'] = 1
             production_profile_df = production_profile_df.loc[production_profile_df.index.get_level_values('s') == 'Avg']
         else:
             # Calculate the average production profile
@@ -154,7 +157,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
             temp = temp.reorder_levels(production_profile_df.index.names)
             production_profile_df = temp
             
-            probability_df = Series(1, index=Index(['Avg'], name='s'))
+        probability_df = Series(1, index=Index(['Avg'], name='s'))
 
 
     if power_plants is not None:
@@ -291,12 +294,16 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         LowerFCAS_Stor_con2[s, t] = LowerFCAS_Stor[s, t] >= Storage[s, t]
 
         # Constraint 9: Total RaiseFCAS (generation + storage) must cover largest unit contingency
-        RaiseFCAS_total_con = Equation(container=m, name="RaiseFCAS_total_con", domain=[g, s, t])
-        RaiseFCAS_total_con[g, s, t] = RaiseFCAS["Coal", s, t] + RaiseFCAS_Stor[s, t] >= coeff_re_fcas * Sum(RE, Gen[RE, s, t])
-
         # Constraint 10: Total LowerFCAS must account for a portion of renewable generation
+        RaiseFCAS_total_con = Equation(container=m, name="RaiseFCAS_total_con", domain=[g, s, t])
         LowerFCAS_total_con = Equation(container=m, name="LowerFCAS_total_con", domain=[g, s, t])
-        LowerFCAS_total_con[g, s, t] = LowerFCAS["Coal", s, t] + LowerFCAS_Stor[s, t] >= coeff_re_fcas * Sum(RE, Gen[RE, s, t])
+        if "Coal" in list(gen_data_df.index.unique()):
+            RaiseFCAS_total_con[g, s, t] = RaiseFCAS["Coal", s, t] + RaiseFCAS_Stor[s, t] >= coeff_re_fcas * Sum(RE, Gen[RE, s, t])
+            LowerFCAS_total_con[g, s, t] = LowerFCAS["Coal", s, t] + LowerFCAS_Stor[s, t] >= coeff_re_fcas * Sum(RE, Gen[RE, s, t])
+
+        else:
+            RaiseFCAS_total_con[g, s, t] = RaiseFCAS_Stor[s, t] >= coeff_re_fcas * Sum(RE, Gen[RE, s, t])
+            LowerFCAS_total_con[g, s, t] = LowerFCAS_Stor[s, t] >= coeff_re_fcas * Sum(RE, Gen[RE, s, t])
 
 
     if emission_constraint is not None:
@@ -409,14 +416,14 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
 
     total_capex = (Cap_sol * (gen_data_df['AnnCapex']+ gen_data_df['FOM'])).sum() + StorCap_sol * (capex_storage + fom_storage)
     total_cost = float(summary_model['Objective'].iloc[0])
-    emission = (emission.groupby('s').sum() * probability_df['Scale'] * extension_factor).sum() / 1e6
+    emission = (emission.groupby('s').sum() * probability_df * extension_factor).sum() / 1e6
     emission_factor = emission / (load_profile_df.sum() * extension_factor) * 1e6
     cost_emission = emission * social_cost_emission 
     total_opex = total_cost - total_capex - cost_emission
     
 
     # Display summary
-    generation_grouped = (Gen_sol.unstack('g').groupby('s').sum().T * probability_df['Scale']).sum(axis=1) * extension_factor
+    generation_grouped = (Gen_sol.unstack('g').groupby('s').sum().T * probability_df).sum(axis=1) * extension_factor
     
     summary = {i: [Cap_sol[i], generation_grouped.loc[i], gen_data_df["AnnCapex"][i] * Cap_sol[i], gen_data_df["FOM"][i] * Cap_sol[i], gen_data_df["Capex"][i] * Cap_sol[i]] for i in Cap_sol.index}
     summary.update({"Storage": [StorCap_sol, 0, capex_storage * StorCap_sol, fom_storage * StorCap_sol, storage_cost_df['Capex' ] * StorCap_sol]})
@@ -437,71 +444,21 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     
     if path_output is not None:
         summary.to_csv(os.path.join(path_output, 'summary.csv'))
+        
+    print('End of model: {}'.format(name_model))
 
     return summary
 
-
-def plot_generation_mix(df, discrete_time=True, path_save='output/generation_mix.png', xlabel="Time (hours)"):
-    """
-    Plots the generation mix and load curve from a pandas DataFrame in a flexible and replicable way.
+def run_model_wrapper(args):
     
-    Parameters:
-    - df: pandas DataFrame containing generation technologies and 'Load', indexed by time steps.
-    - discrete_time: Boolean, if True the time is treated as discrete (bar plot); if False, time is continuous (area plot).
-    """
-
-
-    # Define a dictionary for standard colors based on IEA or common practice
-    color_dict = {
-        'Coal': 'black',
-        'Solar': 'yellow',
-        'Wind': 'lightgreen',
-        'Storage generation': 'lightblue',
-        'Hydro': 'blue',
-        'Gas': 'gey',
-        'Nuclear': 'orange',
-        'Biomass': 'brown',
-        'Geothermal': 'purple'
-    }
+    start_time = time.time()
     
-    # Extract time steps and load data
-    time_steps = df.index.get_level_values('t')
-    load = df['Load']
+    s, values, input_model_run = args    
+    result = run_model(name_model=s, **values, **input_model_run)
+    
+    elapsed_time = time.time() - start_time
 
-    # Define the generation technologies from the DataFrame (all columns except 'Load')
-    power_plants = [col for col in df.columns if col != 'Load' and col in color_dict.keys()]
-
-    # Check if all power plants are in the color_dict, assign default color if missing
-    colors = [color_dict.get(plant, 'gray') for plant in power_plants]
-
-    plt.figure(figsize=(10, 6))
-
-    # Plot the generation data as a stacked bar or area plot depending on `discrete_time`
-    if discrete_time:
-        bottom = [0] * len(time_steps)  # Initialize the bottom for stacking bars
-        for i, plant in enumerate(power_plants):
-            plt.bar(time_steps, df[plant], bottom=bottom, color=colors[i], label=plant)
-            bottom = [a + b for a, b in zip(bottom, df[plant])]
-    else:
-        # For continuous time, use a stacked area plot
-        plt.stackplot(time_steps, *[df[plant] for plant in power_plants], labels=power_plants, colors=colors)
-
-    # Plot the load curve (line plot)
-    plt.plot(time_steps, load, color="red", label="Load", linewidth=2, linestyle="--")
-
-    # Labels and Title
-    plt.xlabel(xlabel)
-    plt.ylabel("Generation / Load (kW)")
-    plt.title("Generation Mix and Load")
-
-    # Legend
-    plt.legend()
-
-    # Show plot
-    plt.tight_layout()
-    plt.savefig(path_save)
-    plt.close()
-
+    return s, result, elapsed_time
 
 if __name__ == '__main__':
     import logging
@@ -514,26 +471,22 @@ if __name__ == '__main__':
     # Start time of the script
     start_time = time.time()
     logging.info("Process started")
-
-    run = 'china' # 'india'
     
     folder = 'output'
     if not os.path.exists(folder):
         os.mkdir(folder)
     
-    input_model = None
-    if run == 'china':
-        input_china = {
+    input_model = {
+        'china': {
             'generation_cost': 'generation_cost/generation_cost_china.csv',
             'load_profile': 'load_profile/load_profile_china.csv',
             'production_profile_solar': 'production_profile/production_profile_solar_china.csv',
             'production_profile_wind': 'production_profile/production_profile_wind_china.csv',
             'storage_cost': 'generation_cost/storage_cost_china.csv',
-            'probability': 'production_profile/probability_china.csv'
-            }
-        input_model = input_china
-    elif run == 'india':
-        input_india = {
+            'probability': 'production_profile/probability_china.csv',
+            'duration': 'day'
+            },
+        'india': {
             'generation_cost': 'generation_cost/generation_cost_india.csv',
             'load_profile': 'load_profile/load_profile_india_year.csv',
             'production_profile_solar': 'production_profile/production_profile_solar_india_year.csv',
@@ -541,39 +494,70 @@ if __name__ == '__main__':
             'storage_cost': 'generation_cost/storage_cost_india.csv',
             'duration': 'year'
             }
-        input_model = input_india
-    
-    if True:
+    }
+
+    run, test, cpu = 'india', False, 2 # 'india'
+
+    if cpu is None:
+        cpu = max(cpu_count() - 2, 1) 
+        
+    if not test:
         folder = os.path.join('output', run)
         if not os.path.exists(folder):
             os.mkdir(folder)
 
         scenarios = {'deterministic': {'deterministic': True, 'power_plants': None, 'path_output': folder},
-                    'deterministic_renewable': {'deterministic': True, 'power_plants': ['Solar', 'Wind'], 'path_output': folder},
-                    'deterministic_solar': {'deterministic': True, 'power_plants': ['Solar'], 'path_output': folder},
                     'deterministic_no_fcas': {'deterministic': True, 'power_plants': None, 'path_output': folder, 'fcas_constraint': False},
-                    'stochastic_optimal': {'deterministic': False, 'power_plants': None},
+                    'deterministic_renewable': {'deterministic': True, 'power_plants': ['Solar', 'Wind'], 'path_output': folder},
+                    'deterministic_renewable_no_fcas': {'deterministic': True, 'power_plants': ['Solar', 'Wind'], 'path_output': folder, 'fcas_constraint': False},
+                    'deterministic_solar': {'deterministic': True, 'power_plants': ['Solar'], 'path_output': folder},
+                    'stochastic': {'deterministic': False, 'power_plants': None},
                     'stochastic_renewable': {'deterministic': False, 'power_plants': ['Solar', 'Wind']},
                     'stochastic_solar': {'deterministic': False, 'power_plants': ['Solar']}
                      }
-        
         scenarios_carbon = {'deterministic_{}'.format(i): {'deterministic': True, 'power_plants': None, 'path_output': None, 'emission_constraint': i} for i in [None] + list(range(50, 400, 50))}
         scenarios.update(scenarios_carbon)
-
-        # scenarios = {'test': {'deterministic': True, 'power_plants': None, 'path_output': folder, 'emission_constraint': 50}}
         
-        results = {s: run_model(name_model=s, **values, **input_model) for s, values in scenarios.items()}
-        results = concat(results, axis=0)
-        results.to_csv(os.path.join(folder, 'summary_scenarios_{}.csv'.format(run)))
+        scenarios = {
+                    'deterministic': {'deterministic': True, 'power_plants': None},
+                    'deterministic_no_fcas': {'deterministic': True, 'power_plants': None, 'fcas_constraint': False},
+                    'deterministic_cstr': {'deterministic': True, 'power_plants': None, 'emission_constraint': 100},
+                    'stochastic': {'deterministic': False, 'power_plants': None},
+                    'stochastic_no_fcas': {'deterministic': False, 'power_plants': None, 'fcas_constraint': False},
+                    'stochastic_emission_cstr': {'deterministic': False, 'power_plants': None, 'emission_constraint': 100}
+        }
         
-        # Log the end of the process and the duration
-        logging.info("Process finished")
-        logging.info(f"Total processing time: {time.time() - start_time:.2f} seconds")
+        args = [(s, values, input_model[run]) for s, values in scenarios.items()]
 
+        # Use a pool of workers to run the calculations in parallel
+        with Pool(cpu) as pool:
+            results = pool.map(run_model_wrapper, args)
+
+        # Combine the results into a dictionary
+        results_dict = {s: result for s, result, _ in results}
+
+        # Merge the results into a single DataFrame
+        merged_results = concat(results_dict.values(), axis=0)
+        
+        """results = {s: run_model(name_model=s, **values, **input_model[run]) for s, values in scenarios.items()}
+        results = concat(results, axis=0)"""
+        merged_results.to_csv(os.path.join(folder, 'summary_scenarios_{}.csv'.format(run)))
+        
+        run_times = {s: elapsed_time for s, _, elapsed_time in results}
+        # Save the run times to a file
+        with open(os.path.join(folder, 'run_times_{}.csv'.format(run)), 'w') as file:
+            for s, elapsed_time in run_times.items():
+                file.write(f"{s},{elapsed_time}\n")
+        
     else:
         folder = os.path.join('output', 'test')
         if not os.path.exists(folder):
             os.mkdir(folder)
-        run_model(name_model='test', deterministic=True, power_plants=None, path_output=folder, duration='day', **input_model)
-
-print('End of script')
+        #run_model(name_model='test', deterministic=True, power_plants=None, path_output=folder, duration='day', **input_model[run])
+        summary = run_model(name_model='test', deterministic=False, power_plants=None, path_output=None, fcas_constraint=True, **input_model[run])
+        summary.to_csv(os.path.join(folder, 'summary_test.csv'))
+    
+    # Log the end of the process and the duration
+    logging.info("Process finished")
+    logging.info(f"Total processing time: {time.time() - start_time:.2f} seconds")
+    

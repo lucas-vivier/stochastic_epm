@@ -105,9 +105,9 @@ if __name__ == '__main__':
     import os
     from pandas import concat
     # Example usage:
-    name_data = "india_use_case"
-    locations = [(14.4602, 77.4494)]   # List of (latitude, longitude) tuples
-    power_type = 'solar'  # or 'wind'
+    name_data = "beijing_use_case"
+    locations = [(39.9057, 116.3913)]   # List of (latitude, longitude) tuples
+    power_type = 'wind'  # or 'solar'
     
     output = "export_renewable_data"
     # Make folder
