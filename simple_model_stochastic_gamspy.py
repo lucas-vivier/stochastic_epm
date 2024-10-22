@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plants=None, 
               path_output=None, generation_cost=None, load_profile=None, production_profile_solar=None, production_profile_wind=None, 
-              storage_cost=None, probability=None, duration='day'):
+              storage_cost=None, probability=None, duration='day', social_cost_emission=0, fcas_constraint=True, emission_constraint=None):
     """
     Main function to run the energy planning model with stochastic renewable generation.
     
@@ -43,7 +43,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     cost_unmet, cost_surplus = 1, 0 # $/kWh, $/kWh
     rampup_coal, rampdown_coal = 1.5, 0.5 # doesn't work in the current version
     min_gen_coal_coef = 0.4
-    coal_ramp, min_gen_coal, total_capacity_constraint, fcas_constraint = True, True, True, False
+    coal_ramp, min_gen_coal, total_capacity_constraint = True, True, True
     
     # Extension factor
     extension_factor = 365
@@ -177,7 +177,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
 
     # -------------------------
     # Define parameters
-    list_parameters = ['FOM', 'Opex', 'AnnCapex']
+    list_parameters = ['FOM', 'Opex', 'AnnCapex', 'Emission']
     gen_data = {i: Parameter(container=m, name=i, domain=g, records=gen_data_df[i].reset_index()) for i in gen_data_df.columns if i in list_parameters}
     
     production_profile = Parameter(container=m, name='ProductionProfile', domain=[RE, t, s], records=production_profile_df)
@@ -199,7 +199,7 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     StorGen = Variable(container=m, name='StorGen', domain=[s, t], type="Positive")
     Unmet = Variable(container=m, name='Unmet', domain=[s, t], type="Positive")
     Surplus = Variable(container=m, name='Surplus', domain=[s, t], type="Positive")
-    
+        
     if fcas_constraint is True:
         RaiseFCAS = Variable(container=m, name='RaiseFCAS', domain=[g, s, t], type="Positive")
         LowerFCAS = Variable(container=m, name='LowerFCAS', domain=[g, s, t], type="Positive")
@@ -213,7 +213,6 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     Demand = Equation(container=m, name="Demand", domain=[s, t])
     Demand[s, t] = Sum(g, Gen[g, s, t]) + StorGen[s, t] * efficiency_storage + Unmet[s, t] - Surplus[s, t] == load_profile[t] + StorInj[s, t]
     
-
     # Define the Storage Balance equation
     StorBal = Equation(container=m, name="StorBal", domain=[s, t])
     StorBal[s, t].where[Ord(t) > 1] = Storage[s, t] == Storage[s, t.lag(1)] + StorInj[s, t] - StorGen[s, t]
@@ -299,10 +298,16 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         LowerFCAS_total_con = Equation(container=m, name="LowerFCAS_total_con", domain=[g, s, t])
         LowerFCAS_total_con[g, s, t] = LowerFCAS["Coal", s, t] + LowerFCAS_Stor[s, t] >= coeff_re_fcas * Sum(RE, Gen[RE, s, t])
 
+
+    if emission_constraint is not None:
+        # Emission constraint
+        EmissionCon = Equation(container=m, name="EmissionCon")
+        EmissionCon[...] = Sum((g, s, t), Gen[g, s, t] * gen_data["Emission"][g] * probability_scenario[s]) * extension_factor <= emission_constraint * Sum(t, load_profile[t]) * extension_factor
+
     # -------------------------
 
     # Define the objective function
-    obj = Sum((g, s, t), Gen[g, s, t] * gen_data["Opex"][g] * extension_factor * probability_scenario[s]) + Sum((s, t), (Unmet[s, t] * cost_unmet + Surplus[s, t] * cost_surplus) * extension_factor * probability_scenario[s]) + Sum(g, Cap[g] * (gen_data["AnnCapex"][g] + gen_data["FOM"][g])) + StorCap * (capex_storage + fom_storage)
+    obj = Sum((g, s, t), Gen[g, s, t] * gen_data["Opex"][g] * extension_factor * probability_scenario[s]) + Sum((s, t), (Unmet[s, t] * cost_unmet + Surplus[s, t] * cost_surplus) * extension_factor * probability_scenario[s]) + Sum(g, Cap[g] * (gen_data["AnnCapex"][g] + gen_data["FOM"][g])) + StorCap * (capex_storage + fom_storage) + social_cost_emission * Sum((g, s, t), Gen[g, s, t] * gen_data["Emission"][g] * extension_factor * probability_scenario[s]) / 1e6
     
     # -------------------------
     # Define and solve the model
@@ -347,9 +352,8 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     Surplus_sol = extract_results(Surplus.records)
     Storage = extract_results(Storage.records)
     
-    dual_value_demand = extract_results(Demand.records, column='marginal')
-
     generation = Gen_sol.unstack('g')
+    
     generation = concat((generation, 
                          StorInj_sol.rename('storage_inj'), 
                          StorGen_sol.rename('storage_gen'),
@@ -376,6 +380,14 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     generation = generation.reorder_levels(['t', 's'])
     generation = generation.join(load_profile_df, how='inner')
     
+    dual_value_demand = extract_results(Demand.records, column='marginal')
+    generation = generation.join(dual_value_demand.rename('dual_demand'), how='inner')
+    
+    emission = (Gen_sol.unstack('g') * gen_data_df['Emission']).sum(axis=1)
+    generation = generation.join(emission.rename('emission'), how='inner')
+
+
+    # Figure    
     if path_output is not None:
         generation.rename(columns={'storage_inj': 'Storage injection', 'storage_gen': 'Storage generation'}, inplace=True)
         
@@ -397,17 +409,31 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
 
     total_capex = (Cap_sol * (gen_data_df['AnnCapex']+ gen_data_df['FOM'])).sum() + StorCap_sol * (capex_storage + fom_storage)
     total_cost = float(summary_model['Objective'].iloc[0])
-    total_opex = total_cost - total_capex
+    emission = (emission.groupby('s').sum() * probability_df['Scale'] * extension_factor).sum() / 1e6
+    emission_factor = emission / (load_profile_df.sum() * extension_factor) * 1e6
+    cost_emission = emission * social_cost_emission 
+    total_opex = total_cost - total_capex - cost_emission
+    
 
     # Display summary
-    summary = {i: [Cap_sol[i], gen_data_df["AnnCapex"][i] * Cap_sol[i], gen_data_df["FOM"][i] * Cap_sol[i], gen_data_df["Capex"][i] * Cap_sol[i]] for i in Cap_sol.index}
-    summary.update({"Storage": [StorCap_sol, capex_storage * StorCap_sol, fom_storage * StorCap_sol, storage_cost_df['Capex' ] * StorCap_sol]})
+    generation_grouped = (Gen_sol.unstack('g').groupby('s').sum().T * probability_df['Scale']).sum(axis=1) * extension_factor
+    
+    summary = {i: [Cap_sol[i], generation_grouped.loc[i], gen_data_df["AnnCapex"][i] * Cap_sol[i], gen_data_df["FOM"][i] * Cap_sol[i], gen_data_df["Capex"][i] * Cap_sol[i]] for i in Cap_sol.index}
+    summary.update({"Storage": [StorCap_sol, 0, capex_storage * StorCap_sol, fom_storage * StorCap_sol, storage_cost_df['Capex' ] * StorCap_sol]})
     summary = DataFrame(summary).T
-    summary.columns = ['Capacities (kW)', 'Capex ($/y)', 'FOM ($/y)', 'Total capex ($)']
+    summary.columns = ['Capacities (kW)', 'Generation (kWh)', 'Capex ($/y)', 'FOM ($/y)', 'Total capex ($)']
 
     summary.loc['Total'] = summary.sum()
+    summary.loc['Total', 'Emission factor (gCO2/kWh)'] = emission_factor
+    summary.loc['Total', 'Emission (tCO2/y)'] = emission
+    summary.loc['Total', 'Expected cost emission ($/y)'] = cost_emission
     summary.loc['Total', 'Expected opex ($/y)'] = total_opex
-    summary.loc['Total', 'Expected cost ($/y)'] = total_cost
+    summary.loc['Total', 'Expected private cost ($/y)'] = total_cost - cost_emission
+    summary.loc['Total', 'Expected social cost ($/y)'] = total_cost
+    
+    if emission_constraint is not None:
+        shadow_price_carbon = - extract_results(EmissionCon.records, column='marginal') * 1e6
+        summary.loc['Total', 'Shadow price carbon ($/tCO2)'] = shadow_price_carbon
     
     if path_output is not None:
         summary.to_csv(os.path.join(path_output, 'summary.csv'))
@@ -517,21 +543,25 @@ if __name__ == '__main__':
             }
         input_model = input_india
     
-    if False:
+    if True:
         folder = os.path.join('output', run)
         if not os.path.exists(folder):
             os.mkdir(folder)
-        
-        scenarios = {'deterministic_optimal': {'deterministic': True, 'power_plants': None, 'path_output': folder},
+
+        scenarios = {'deterministic': {'deterministic': True, 'power_plants': None, 'path_output': folder},
                     'deterministic_renewable': {'deterministic': True, 'power_plants': ['Solar', 'Wind'], 'path_output': folder},
                     'deterministic_solar': {'deterministic': True, 'power_plants': ['Solar'], 'path_output': folder},
-                        'stochastic_optimal': {'deterministic': False, 'power_plants': None},
-                        'stochastic_renewable': {'deterministic': False, 'power_plants': ['Solar', 'Wind']},
-                        'stochastic_solar': {'deterministic': False, 'power_plants': ['Solar']}
-                        }
-        # scenarios = {'deterministic_renewable': {'deterministic': True, 'power_plants': ['Solar'], 'path_output': folder}}
+                    'deterministic_no_fcas': {'deterministic': True, 'power_plants': None, 'path_output': folder, 'fcas_constraint': False},
+                    'stochastic_optimal': {'deterministic': False, 'power_plants': None},
+                    'stochastic_renewable': {'deterministic': False, 'power_plants': ['Solar', 'Wind']},
+                    'stochastic_solar': {'deterministic': False, 'power_plants': ['Solar']}
+                     }
+        
+        scenarios_carbon = {'deterministic_{}'.format(i): {'deterministic': True, 'power_plants': None, 'path_output': None, 'emission_constraint': i} for i in [None] + list(range(50, 400, 50))}
+        scenarios.update(scenarios_carbon)
 
-
+        # scenarios = {'test': {'deterministic': True, 'power_plants': None, 'path_output': folder, 'emission_constraint': 50}}
+        
         results = {s: run_model(name_model=s, **values, **input_model) for s, values in scenarios.items()}
         results = concat(results, axis=0)
         results.to_csv(os.path.join(folder, 'summary_scenarios_{}.csv'.format(run)))

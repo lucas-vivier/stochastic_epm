@@ -5,6 +5,7 @@ export_renewable_data/
 data/
 output/test
 test/
+output/
 
 # Python
 __pycache__/
