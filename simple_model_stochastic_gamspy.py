@@ -13,10 +13,11 @@ import matplotlib.pyplot as plt
 from figures import plot_generation_mix
 
 
-def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plants=None, 
+def run_model(name_model='StochasticModel', deterministic=False, power_plants=None, 
               path_output=None, generation_cost=None, load_profile=None, production_profile_solar=None, production_profile_wind=None, 
               storage_cost=None, probability=None, duration='day', social_cost_emission=0, fcas_constraint=True, emission_constraint=None,
-              cost_unmet=1, cost_surplus=0, rampup_coal=1.5, rampdown_coal=0.5, min_gen_coal_coef=0.4):
+              cost_unmet=1, cost_surplus=0, rampup_coal=1.5, rampdown_coal=0.5, min_gen_coal_coef=0.4,
+              limit_fcas_capacity=0.1, limit_fcas_storage=0.5, coeff_re_fcas=0.1):
     """
     Main function to run the energy planning model with stochastic renewable generation.
     
@@ -31,6 +32,18 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
     - storage_cost: str, name of the file with storage cost data
     - probability: str, name of the file with probability data
     - duration: str, duration of the model (e.g. 'year')
+    - social_cost_emission: float, social cost of carbon emissions, default is 0
+    - fcas_constraint: Boolean, if True the model includes FCAS constraints, default is True
+    - emission_constraint: float, emission constraint in tCO2, default is None
+    - cost_unmet: float, cost of unmet demand, default is 1
+    - cost_surplus: float, cost of surplus generation, default is 0
+    - rampup_coal: float, ramp-up rate for coal power plants, default is 1.5
+    - rampdown_coal: float, ramp-down rate for coal power plants, default is 0.5
+    - min_gen_coal_coef: float, minimum generation for coal power plants, default is 0.4
+    - limit_fcas_capacity: float, limit for FCAS capacity, default is 0.1
+    - limit_fcas_storage: float, limit for FCAS storage, default is 0.5
+    - coeff_re_fcas: float, coefficient for FCAS constraint, default is 0.1
+    
     
     Returns:
     - summary: pandas DataFrame with the summary of the model results
@@ -255,46 +268,42 @@ def run_model(name_model='ChinaStochasticModel', deterministic=False, power_plan
         CapCon1 = Equation(container=m, name="CapCon1", domain=[g, s])
         CapCon1[g, s] = Sum(t, Gen[g, s, t]) <= Cap[g] * len(t.records) * 0.9
         
-    if fcas_constraint is True:
-        limit_fcas_capacity = 0.1
-        limit_fcas_storage = 0.5
-        coeff_re_fcas = 0.15
-        
-        # Constraint 1: Limit RaiseFCAS to 10% of the generation capacity
+    if fcas_constraint is True:        
+        # Limit RaiseFCAS to 10% of the generation capacity
         RaiseFCAS_con = Equation(container=m, name="RaiseFCAS_con", domain=[g, s, t])
         RaiseFCAS_con[g, s, t] = RaiseFCAS[g, s, t] <= Cap[g] * limit_fcas_capacity
 
-        # Constraint 2: Limit LowerFCAS to 10% of the generation capacity
+        # Limit LowerFCAS to 10% of the generation capacity
         LowerFCAS_con = Equation(container=m, name="LowerFCAS_con", domain=[g, s, t])
         LowerFCAS_con[g, s, t] = LowerFCAS[g, s, t] <= Cap[g] * limit_fcas_capacity
 
-        # Constraint 3: Storage can provide up to 50% of its capacity as RaiseFCAS
+        # torage can provide up to 50% of its capacity as RaiseFCAS
         RaiseFCAS_Stor_con = Equation(container=m, name="RaiseFCAS_Stor_con", domain=[s, t])
         RaiseFCAS_Stor_con[s, t] = RaiseFCAS_Stor[s, t] <= StorCap * limit_fcas_storage
 
-        # Constraint 4: Storage can provide up to 50% of its capacity as LowerFCAS
+        # Storage can provide up to 50% of its capacity as LowerFCAS
         LowerFCAS_Stor_con = Equation(container=m, name="LowerFCAS_Stor_con", domain=[s, t])
         LowerFCAS_Stor_con[s, t] = LowerFCAS_Stor[s, t] <= StorCap * limit_fcas_storage
         
-        # Constraint 6: Maintain a minimum operational level for coal (40% of capacity)
+        # Maintain a minimum operational level for coal (40% of capacity)
         if "Coal" in list(gen_data_df.index.unique()):
             Gen_LowerFCAS_con = Equation(container=m, name="Gen_LowerFCAS_con", domain=[s, t])
             Gen_LowerFCAS_con[s, t] = Gen["Coal", s, t] - LowerFCAS["Coal", s, t] >= Cap["Coal"] * min_gen_coal_coef
 
-        # Constraint 5: Ensure total generation including RaiseFCAS does not exceed capacity
+        # Ensure total generation including RaiseFCAS does not exceed capacity
         Gen_RaiseFCAS_con = Equation(container=m, name="Gen_RaiseFCAS_con", domain=[g, s, t])
         Gen_RaiseFCAS_con[g, s, t] = Gen[g, s, t] + RaiseFCAS[g, s, t] <= Cap[g]
         
-        # Constraint 7: Limit storage generation plus RaiseFCAS to available storage
+        # Limit storage generation plus RaiseFCAS to available storage
         StorGen_RaiseFCAS_con = Equation(container=m, name="StorGen_RaiseFCAS_con", domain=[s, t])
         StorGen_RaiseFCAS_con[s, t] = StorGen[s, t] + RaiseFCAS_Stor[s, t] <= Storage[s, t]
 
-        # Constraint 8: Ensure LowerFCAS does not exceed available storage charge
+        # Ensure LowerFCAS does not exceed available storage charge
         LowerFCAS_Stor_con2 = Equation(container=m, name="LowerFCAS_Stor_con2", domain=[s, t])
         LowerFCAS_Stor_con2[s, t] = LowerFCAS_Stor[s, t] >= Storage[s, t]
 
-        # Constraint 9: Total RaiseFCAS (generation + storage) must cover largest unit contingency
-        # Constraint 10: Total LowerFCAS must account for a portion of renewable generation
+        # Total RaiseFCAS (generation + storage) must cover largest unit contingency
+        # Total LowerFCAS must account for a portion of renewable generation
         RaiseFCAS_total_con = Equation(container=m, name="RaiseFCAS_total_con", domain=[g, s, t])
         LowerFCAS_total_con = Equation(container=m, name="LowerFCAS_total_con", domain=[g, s, t])
         if "Coal" in list(gen_data_df.index.unique()):
@@ -460,6 +469,7 @@ def run_model_wrapper(args):
 
     return s, result, elapsed_time
 
+
 if __name__ == '__main__':
     import logging
     import time
@@ -496,7 +506,7 @@ if __name__ == '__main__':
             }
     }
 
-    run, test, cpu = 'india', False, 2 # 'india'
+    run, test, cpu = 'india', False, 1 # 'india'
 
     if cpu is None:
         cpu = max(cpu_count() - 2, 1) 
@@ -512,6 +522,7 @@ if __name__ == '__main__':
                     'deterministic_renewable_no_fcas': {'deterministic': True, 'power_plants': ['Solar', 'Wind'], 'path_output': folder, 'fcas_constraint': False},
                     'deterministic_solar': {'deterministic': True, 'power_plants': ['Solar'], 'path_output': folder},
                     'stochastic': {'deterministic': False, 'power_plants': None},
+                    'stochastic_no_fcas': {'deterministic': False, 'power_plants': None, 'fcas_constraint': False},
                     'stochastic_renewable': {'deterministic': False, 'power_plants': ['Solar', 'Wind']},
                     'stochastic_solar': {'deterministic': False, 'power_plants': ['Solar']}
                      }
@@ -524,8 +535,33 @@ if __name__ == '__main__':
                     'deterministic_cstr': {'deterministic': True, 'power_plants': None, 'emission_constraint': 100},
                     'stochastic': {'deterministic': False, 'power_plants': None},
                     'stochastic_no_fcas': {'deterministic': False, 'power_plants': None, 'fcas_constraint': False},
-                    'stochastic_emission_cstr': {'deterministic': False, 'power_plants': None, 'emission_constraint': 100}
+                    'stochastic_cstr_no_fcas': {'deterministic': False, 'power_plants': None, 'emission_constraint': 100, 'fcas_constraint': False},
+                    'stochastic_renewable': {'deterministic': False, 'power_plants': ['Solar', 'Wind']},
+                    'stochastic_cstr' : {'deterministic': False, 'power_plants': None, 'emission_constraint': 100}
         }
+        scenarios = {
+            'stochastic': {'deterministic': False, 'power_plants': None},
+            'stochastic_400' : {'deterministic': False, 'power_plants': None, 'emission_constraint': 400},
+            'stochastic_350' : {'deterministic': False, 'power_plants': None, 'emission_constraint': 350},
+            'stochastic_300' : {'deterministic': False, 'power_plants': None, 'emission_constraint': 300},
+            'stochastic_250' : {'deterministic': False, 'power_plants': None, 'emission_constraint': 250},
+            'stochastic_200' : {'deterministic': False, 'power_plants': None, 'emission_constraint': 200},
+            'stochastic_150' : {'deterministic': False, 'power_plants': None, 'emission_constraint': 150},
+            'stochastic_125' : {'deterministic': False, 'power_plants': None, 'emission_constraint': 125},
+            'stochastic_50' : {'deterministic': False, 'power_plants': None, 'emission_constraint': 50},
+            'stochastic_renewable': {'deterministic': False, 'power_plants': ['Solar', 'Wind']},
+            'stochastic_solar': {'deterministic': False, 'power_plants': ['Solar']}
+        }
+        
+        scenarios = {
+            'deterministic': {'deterministic': True, 'power_plants': None, 'path_output': folder},
+            'deterministic_no_fcas': {'deterministic': True, 'power_plants': None, 'path_output': folder, 'fcas_constraint': False},
+            'deterministic_renewable': {'deterministic': True, 'power_plants': ['Solar', 'Wind'], 'path_output': folder},
+            'deterministic_renewable_no_fcas': {'deterministic': True, 'power_plants': ['Solar', 'Wind'], 'path_output': folder, 'fcas_constraint': False},
+            'deterministic_solar': {'deterministic': True, 'power_plants': ['Solar'], 'path_output': folder},
+            'stochastic_solar': {'deterministic': False, 'power_plants': ['Solar']}
+        }
+        
         
         args = [(s, values, input_model[run]) for s, values in scenarios.items()]
 
@@ -537,10 +573,8 @@ if __name__ == '__main__':
         results_dict = {s: result for s, result, _ in results}
 
         # Merge the results into a single DataFrame
-        merged_results = concat(results_dict.values(), axis=0)
-        
-        """results = {s: run_model(name_model=s, **values, **input_model[run]) for s, values in scenarios.items()}
-        results = concat(results, axis=0)"""
+        merged_results = concat(results_dict.values(), keys=results_dict.keys(), axis=0)
+        merged_results.index.names = ['Scenario', 'Technology']
         merged_results.to_csv(os.path.join(folder, 'summary_scenarios_{}.csv'.format(run)))
         
         run_times = {s: elapsed_time for s, _, elapsed_time in results}
